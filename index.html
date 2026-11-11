@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>S Pen Logger - device test</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #fff;
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  /* The canvas owns all pointer input: no browser panning/zooming on it. */
+  #c { position: fixed; inset: 0; display: block; touch-action: none; }
+  #hud {
+    position: fixed; left: 0; right: 0; top: 0; z-index: 2;
+    background: rgba(20, 20, 30, .9); color: #fff; font-size: 14px;
+    padding: 6px 8px; box-sizing: border-box;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+  .cnt b { font-size: 17px; font-variant-numeric: tabular-nums; }
+  .cnt small { opacity: .7; margin-right: 4px; }
+  button, input {
+    font: inherit; font-size: 13px; padding: 5px 9px; border-radius: 6px;
+    border: 1px solid #667; background: #2b2f45; color: #fff;
+  }
+  button.on { background: #b3412f; border-color: #e66; }
+  input { width: 90px; background: #fff; color: #000; }
+  #dbg {
+    display: none; margin: 6px 0 0; padding: 6px; max-height: 38vh; overflow: auto;
+    background: #0b0d18; color: #9fe6a0; font: 11px/1.35 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; border-radius: 6px;
+  }
+  #cal { display: none; margin-top: 6px; }
+  #msg { margin-top: 4px; color: #ffd37a; font-size: 12px; min-height: 14px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div class="row">
+    <span class="cnt"><small>PEN</small><b id="vPen">0.000 m</b></span>
+    <span class="cnt"><small>ERASER</small><b id="vEra">0.000 m</b></span>
+    <span class="cnt"><small>TOTAL</small><b id="vTot">0.000 m</b></span>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <button id="bMode">Tool: PEN</button>
+    <button id="bClear">Clear canvas</button>
+    <button id="bCal">Calibrate</button>
+    <button id="bMouse">Mouse: off</button>
+    <button id="bSync">LowLat: off</button>
+    <button id="bDbg">Debug</button>
+    <button id="bReset">Reset counters</button>
+  </div>
+  <div id="cal" class="row">
+    <span>Real length of the line (mm):</span>
+    <input id="calMm" type="number" inputmode="decimal" step="0.1" min="1">
+    <button id="calOk">Apply</button>
+    <button id="calNo">Cancel</button>
+  </div>
+  <div id="msg"></div>
+  <pre id="dbg"></pre>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------------------------------------------------------------- settings
+  const LS_KEY = 'spenlog.test.v1';
+  const LS_SYNC = 'spenlog.test.lowlat';
+  // Android CSS px is nominally 1/160 inch. Real value is fixed by calibration.
+  const DEFAULT_MM_PER_PX = 25.4 / 160;
+  const ERASER_WIDTH = 28;
+
+  const saved = (() => {
+    try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch { return {}; }
+  })();
+  const st = {
+    penMm: +saved.penMm || 0,
+    eraMm: +saved.eraMm || 0,
+    mmPerPx: +saved.mmPerPx || DEFAULT_MM_PER_PX,
+    toolEraser: false,   // toolbar eraser toggle
+    allowMouse: false,   // desktop testing only
+    lowLat: localStorage.getItem(LS_SYNC) === '1',
+  };
+  const persist = () => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        penMm: st.penMm, eraMm: st.eraMm, mmPerPx: st.mmPerPx,
+      }));
+    } catch {}
+  };
+
+  // ------------------------------------------------------------------ canvas
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d', { desynchronized: st.lowLat, alpha: true });
+  let dpr = 1;
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(innerWidth * dpr);
+    cv.height = Math.round(innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  }
+  resize();
+  addEventListener('resize', resize);
+
+  function drawSeg(x0, y0, x1, y1, pressure, eraser, color) {
+    ctx.globalCompositeOperation = eraser ? 'destination-out' : 'source-over';
+    ctx.strokeStyle = color || '#111';
+    ctx.lineWidth = eraser ? ERASER_WIDTH : 1 + Math.min(1, pressure || 0.5) * 3;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  }
+
+  // --------------------------------------------------------------------- HUD
+  const $ = (id) => document.getElementById(id);
+  const vPen = $('vPen'), vEra = $('vEra'), vTot = $('vTot');
+  const dbg = $('dbg'), msg = $('msg');
+  const fmtM = (mm) => (mm / 1000).toFixed(3) + ' m';
+
+  const live = { text: '' };    // live pointer readout
+  const logLines = [];          // ring buffer of discrete events
+  const lagMs = { ema: 0 };
+  const stamps = [];            // timestamps of recent samples for Hz estimate
+
+  function log(s) {
+    logLines.push(((performance.now() / 1000).toFixed(2)) + 's ' + s);
+    if (logLines.length > 40) logLines.shift();
+  }
+  const bits = (n) => n.toString(2).padStart(6, '0');
+
+  let hudPending = false;
+  function hud() {
+    if (hudPending) return;
+    hudPending = true;
+    requestAnimationFrame(() => {
+      hudPending = false;
+      vPen.textContent = fmtM(st.penMm);
+      vEra.textContent = fmtM(st.eraMm);
+      vTot.textContent = fmtM(st.penMm + st.eraMm);
+      if (dbg.style.display === 'block') {
+        let hz = 0;
+        if (stamps.length > 5) {
+          const dt = stamps[stamps.length - 1] - stamps[0];
+          if (dt > 0) hz = (stamps.length - 1) / (dt / 1000);
+        }
+        dbg.textContent =
+          'LIVE  ' + live.text + '\n' +
+          'sample rate ~' + hz.toFixed(0) + ' Hz | input lag ~' + lagMs.ema.toFixed(1) + ' ms\n' +
+          'DPR ' + dpr + ' | viewport ' + innerWidth + 'x' + innerHeight +
+          ' | screen ' + screen.width + 'x' + screen.height + '\n' +
+          'mm/cssPx ' + st.mmPerPx.toFixed(5) + ' (~' + (25.4 / st.mmPerPx).toFixed(0) + ' css-ppi)' +
+          ' | lowLat ' + st.lowLat + '\n' +
+          'buttons bits: 1=tip 2=barrel(S Pen btn) 32=eraser\n' +
+          '--- events ---\n' + logLines.slice().reverse().join('\n');
+      }
+    });
+  }
+  function say(t) { msg.textContent = t || ''; }
+
+  // ----------------------------------------------------------- input handling
+  const last = new Map();       // pointerId -> {x, y}
+  const cal = { active: false, px: 0, done: false };
+
+  const accept = (e) => e.pointerType === 'pen' || (st.allowMouse && e.pointerType === 'mouse');
+  const isContact = (e) => (e.buttons & 1) !== 0 || e.pressure > 0;
+  // S Pen side button (barrel) held => eraser, like Samsung Notes.
+  const isEraser = (e) => st.toolEraser || (e.buttons & 2) !== 0 || (e.buttons & 32) !== 0;
+
+  function readout(e, tag) {
+    live.text = tag + ' ' + e.pointerType + ' button=' + e.button +
+      ' buttons=' + bits(e.buttons) + ' p=' + e.pressure.toFixed(2) +
+      ' tilt=' + (e.tiltX || 0) + '/' + (e.tiltY || 0) +
+      ' contact=' + isContact(e) + (accept(e) ? '' : ' [IGNORED]');
+  }
+
+  function addDistance(px, eraser) {
+    const mm = px * st.mmPerPx;
+    if (eraser) st.eraMm += mm; else st.penMm += mm;
+  }
+
+  const lastBtns = new Map();
+  cv.addEventListener('pointerdown', (e) => {
+    readout(e, 'DOWN');
+    log('down  ' + e.pointerType + ' button=' + e.button + ' buttons=' + bits(e.buttons) + ' p=' + e.pressure.toFixed(2));
+    if (!accept(e)) { hud(); return; }
+    e.preventDefault();
+    try { cv.setPointerCapture(e.pointerId); } catch {}
+    last.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (cal.active && !cal.done) cal.px = 0;
+    hud();
+  });
+
+  cv.addEventListener('pointermove', (e) => {
+    readout(e, isContact(e) ? 'DRAW' : 'HOVER');
+    if (lastBtns.get(e.pointerId) !== e.buttons) {
+      lastBtns.set(e.pointerId, e.buttons);
+      log('btns  ' + e.pointerType + ' buttons=' + bits(e.buttons) + ' p=' + e.pressure.toFixed(2) + (isContact(e) ? ' (contact)' : ' (hover)'));
+    }
+    lagMs.ema = lagMs.ema * 0.9 + Math.max(0, performance.now() - e.timeStamp) * 0.1;
+    if (!accept(e)) { hud(); return; }
+
+    const prev = last.get(e.pointerId);
+    if (!isContact(e)) {
+      // Pen lifted but pointerup not delivered: end stroke, do not count hover movement.
+      if (prev) last.delete(e.pointerId);
+      hud();
+      return;
+    }
+    if (!prev) { last.set(e.pointerId, { x: e.clientX, y: e.clientY }); hud(); return; }
+
+    // Coalesced events carry every hardware sample between two frames.
+    const evs = (e.getCoalescedEvents && e.getCoalescedEvents()) || [];
+    const list = evs.length ? evs : [e];
+    let px = prev.x, py = prev.y;
+    for (const ev of list) {
+      stamps.push(ev.timeStamp); if (stamps.length > 40) stamps.shift();
+      const d = Math.hypot(ev.clientX - px, ev.clientY - py);
+      if (d > 0) {
+        const er = isEraser(ev);
+        if (cal.active && !cal.done) {
+          cal.px += d;
+          drawSeg(px, py, ev.clientX, ev.clientY, ev.pressure, false, '#1565ff');
+        } else {
+          addDistance(d, er);
+          drawSeg(px, py, ev.clientX, ev.clientY, ev.pressure, er);
+        }
+      }
+      px = ev.clientX; py = ev.clientY;
+    }
+    last.set(e.pointerId, { x: px, y: py });
+    hud();
+  });
+
+  function end(e, tag) {
+    readout(e, tag);
+    log(tag.toLowerCase().padEnd(5) + ' ' + e.pointerType + ' buttons=' + bits(e.buttons));
+    if (last.has(e.pointerId)) {
+      last.delete(e.pointerId);
+      persist();
+      if (cal.active && !cal.done && cal.px > 20) {
+        cal.done = true;
+        $('cal').style.display = 'flex';
+        say('Measured ' + cal.px.toFixed(1) + ' css px. Enter the real length and Apply.');
+      }
+    }
+    lastBtns.delete(e.pointerId);
+    hud();
+  }
+  cv.addEventListener('pointerup', (e) => end(e, 'UP'));
+  cv.addEventListener('pointercancel', (e) => end(e, 'CANCEL'));
+  cv.addEventListener('pointerleave', (e) => { if (e.pointerType === 'pen') log('leave pen (left range)'); hud(); });
+  cv.addEventListener('pointerenter', (e) => { if (e.pointerType === 'pen') log('enter pen (in range)'); });
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // ----------------------------------------------------------------- buttons
+  $('bMode').onclick = () => {
+    st.toolEraser = !st.toolEraser;
+    $('bMode').textContent = 'Tool: ' + (st.toolEraser ? 'ERASER' : 'PEN');
+    $('bMode').classList.toggle('on', st.toolEraser);
+  };
+  $('bClear').onclick = () => {
+    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cv.width, cv.height); ctx.restore();
+  };
+  $('bMouse').onclick = () => {
+    st.allowMouse = !st.allowMouse;
+    $('bMouse').textContent = 'Mouse: ' + (st.allowMouse ? 'on' : 'off');
+  };
+  $('bSync').textContent = 'LowLat: ' + (st.lowLat ? 'on' : 'off');
+  $('bSync').onclick = () => {
+    // The desynchronized hint can only be set at context creation, so reload.
+    localStorage.setItem(LS_SYNC, st.lowLat ? '0' : '1');
+    location.reload();
+  };
+  $('bDbg').onclick = () => {
+    dbg.style.display = dbg.style.display === 'block' ? 'none' : 'block';
+    hud();
+  };
+  $('bReset').onclick = () => {
+    if (!confirm('Reset pen/eraser counters to 0?')) return;
+    st.penMm = 0; st.eraMm = 0; persist(); hud();
+  };
+  $('bCal').onclick = () => {
+    cal.active = true; cal.done = false; cal.px = 0;
+    $('cal').style.display = 'none';
+    say('Calibration: lay a ruler on the screen and draw ONE straight line along a known length (e.g. 100 mm).');
+  };
+  $('calOk').onclick = () => {
+    const mm = parseFloat($('calMm').value);
+    if (!(mm > 0) || !(cal.px > 0)) { say('Enter a valid length.'); return; }
+    st.mmPerPx = mm / cal.px;
+    persist();
+    cal.active = false; cal.done = false;
+    $('cal').style.display = 'none';
+    say('Applied: ' + st.mmPerPx.toFixed(5) + ' mm per css px.');
+    hud();
+  };
+  $('calNo').onclick = () => {
+    cal.active = false; cal.done = false;
+    $('cal').style.display = 'none'; say('');
+  };
+
+  hud();
+})();
+</script>
+</body>
+</html>

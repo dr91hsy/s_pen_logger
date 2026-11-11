@@ -12,7 +12,8 @@
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   /* The canvas owns all pointer input: no browser panning/zooming on it. */
-  #c { position: fixed; inset: 0; display: block; touch-action: none; }
+  /* Explicit size is required: without it the canvas shows at its pixel-buffer size (DPR x too big). */
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
   #hud {
     position: fixed; left: 0; right: 0; top: 0; z-index: 2;
     background: rgba(20, 20, 30, .9); color: #fff; font-size: 14px;
@@ -254,7 +255,15 @@
   cv.addEventListener('pointercancel', (e) => end(e, 'CANCEL'));
   cv.addEventListener('pointerleave', (e) => { if (e.pointerType === 'pen') log('leave pen (left range)'); hud(); });
   cv.addEventListener('pointerenter', (e) => { if (e.pointerType === 'pen') log('enter pen (in range)'); });
-  document.addEventListener('contextmenu', (e) => e.preventDefault());
+  // Extra probes: the S Pen side button may surface as mouse-compat events
+  // (contextmenu / auxclick / mousedown) instead of pointer `buttons` bits.
+  document.addEventListener('contextmenu', (e) => { log('contextmenu'); e.preventDefault(); });
+  for (const t of ['mousedown', 'mouseup', 'auxclick']) {
+    cv.addEventListener(t, (e) => {
+      log(t.padEnd(9) + ' button=' + e.button + ' buttons=' + bits(e.buttons));
+      hud();
+    });
+  }
 
   // ----------------------------------------------------------------- buttons
   $('bMode').onclick = () => {
